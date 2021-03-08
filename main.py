@@ -1,6 +1,5 @@
 import dgl
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,56 +10,74 @@ from dgl import DGLGraph
 import dgl.function as fn
 from functools import partial
 
+import networkx as nx
 
-class RGATLayer(nn.module):
-    def __init__(self, g, in_dim, out_dim, num_rels, num_heads=5):
+
+class RGATLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, num_rels, num_heads=5):
         super(RGATLayer, self).__init__()
-        self.g = g
         self.num_rels = num_rels
         self.num_heads = num_heads
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
 
         # Todo : try the basis sharing trick
-        self.attn_fcs = [nn.Linear(2 * out_dim, num_heads, bias=False) for _ in range(num_rels)]
+        # self.attn_fcs = [nn.Linear(2 * out_dim, num_heads, bias=False) for _ in range(num_rels)]
+        self.attn_fcs = nn.Parameter(torch.Tensor(self.num_rels, 2 * out_dim, num_heads))
         self.reset_parameters()
 
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
         gain = nn.init.calculate_gain('relu')
         nn.init.xavier_normal_(self.fc.weight, gain=gain)
-        for attn_fc in self.attn_fcs:
-            nn.init.xavier_normal_(attn_fc.weight, gain=gain)
+        nn.init.xavier_normal_(self.attn_fcs, gain=gain)
+        # for attn_fc in self.attn_fcs:
+        #     nn.init.xavier_normal_(attn_fc.weight, gain=gain)
 
     def edge_attention(self, edges):
         """
         This is where the relational part hits
         """
         z2 = torch.cat([edges.src['z'], edges.dst['z']], dim=1)
-        net_to_use = self.attn_fcs[edges.data['rel_type']]
-        a = net_to_use(z2)
+        w = self.attn_fcs[edges.data['rel_type']]
+        a = torch.bmm(z2.unsqueeze(1), w)
+        a = a.squeeze()
+        # print(a.shape)
         return {'e': F.leaky_relu(a)}
 
     def message_func(self, edges):
+        # print(edges.src['z'].shape)
+        # print(edges.data['e'].shape)
         return {'z': edges.src['z'], 'e': edges.data['e']}
 
     def reduce_func(self, nodes):
         """
         Now use concatenation for the aggregation
         """
-        all_attentions = nodes.mailbox['e']   # shape : (nei, heads)
-        all_messages = nodes.mailbox['z']   # shape : (nei, out_dim)
-        all_attentions.unsqueeze(-1)
-        all_messages.unsqueeze(-2)
-        concats = torch.bmm(all_attentions, all_messages)
-        h = torch.sum(concats, dim=1)
+        all_attentions = nodes.mailbox['e']  # shape : (similar_nodes, nei, heads)
+        all_messages = nodes.mailbox['z']  # shape : (similar_nodes, nei, out_dim)
+
+        # Compute scaling of messages with einsum and concatenate, then aggregate over neighbors
+        scaled_messages = torch.einsum('abi,abj->abij',
+                                       (all_attentions, all_messages))  # shape : (similar_nodes, nei, heads, out_dim)
+        concatenated = torch.flatten(scaled_messages, start_dim=2)  # shape : (similar_nodes, nei, heads * out_dim)
+        h = torch.sum(concatenated, dim=1)  # shape : (similar_nodes, heads * out_dim)
+        # print(all_attentions.shape)
+        # print(all_messages.shape)
+        # print(scaled_messages.shape)
+        # print(concatenated.shape)
+        # print(h.shape)
+        # print()
+
+        # TODO : add self-loop reduction
         return {'h': h}
 
-    def forward(self, h):
+    def forward(self, g):
+        h = g.ndata['h']
         z = self.fc(h)
-        self.g.ndata['z'] = z
-        self.g.apply_edges(self.edge_attention)
-        self.g.update_all(self.message_func, self.reduce_func)
-        return self.g.ndata.pop('h')
+        g.ndata['z'] = z
+        g.apply_edges(self.edge_attention)
+        g.update_all(self.message_func, self.reduce_func)
+        return g.ndata.pop('h')
 
 
 class GATLayer(nn.Module):
@@ -100,6 +117,7 @@ class GATLayer(nn.Module):
         self.g.update_all(self.message_func, self.reduce_func)
         return self.g.ndata.pop('h')
 
+
 class RGCNLayer(nn.Module):
     def __init__(self, in_feat, out_feat, num_rels, num_bases=-1, bias=None,
                  activation=None, is_input_layer=False):
@@ -111,7 +129,6 @@ class RGCNLayer(nn.Module):
         self.bias = bias
         self.activation = activation
         self.is_input_layer = is_input_layer
-
 
         # weight bases in equation (3)
         self.weight = nn.Parameter(torch.Tensor(self.num_rels, self.in_feat,
@@ -148,8 +165,53 @@ class RGCNLayer(nn.Module):
         g.update_all(message_func, fn.sum(msg='msg', out='h'), apply_func)
 
 
+import os
+import json
+from networkx.readwrite import json_graph
 
 
+def dump_json(filename, graph):
+    g_json = json_graph.node_link_data(graph)
+    json.dump(g_json, open(filename, 'w'), indent=2)
 
 
+def load_json(filename):
+    with open(filename, 'r') as f:
+        js_graph = json.load(f)
+    out_graph = json_graph.node_link_graph(js_graph)
+    return out_graph
 
+
+if __name__ == '__main__':
+    graph_path = '5e3h.json'
+
+    edge_map = {'B53': 0, 'cHH': 1, 'cHS': 2, 'cHW': 3, 'cSH': 2, 'cSS': 4, 'cSW': 5, 'cWH': 3, 'cWS': 5, 'cWW': 6,
+                'tHH': 7, 'tHS': 8, 'tHW': 9, 'tSH': 8, 'tSS': 10, 'tSW': 11, 'tWH': 9, 'tWS': 11, 'tWW': 12}
+
+    in_dim = 3
+    out_dim = 4
+    num_rels = len(edge_map)
+
+    graph = load_json(graph_path)
+    graph = nx.to_undirected(graph)
+    graph = nx.to_directed(graph)
+
+    # Add constant ones on the first layer
+    constant_nodes = {node: torch.ones(in_dim) for node in graph.nodes()}
+    nx.set_node_attributes(graph, name='h', values=constant_nodes)
+
+    # Add one hot edge encoding and fake norm fur RGCN runs
+    one_hot = {edge: torch.tensor(edge_map[label]) for edge, label in
+               (nx.get_edge_attributes(graph, 'LW')).items()}
+    fake_norm = {edge: torch.ones(1) for edge in graph.edges()}
+    nx.set_edge_attributes(graph, name='norm', values=fake_norm)
+    nx.set_edge_attributes(graph, name='rel_type', values=one_hot)
+
+    # Send to DGL
+    g_dgl = dgl.from_networkx(nx_graph=graph, node_attrs=['h'], edge_attrs=['rel_type', 'norm'])
+
+    # rgcn = RGCNLayer(in_feat=in_dim, out_feat=out_dim, num_rels=num_rels)
+    # rgcn(g_dgl)
+    #
+    rgat = RGATLayer(in_dim=in_dim, out_dim=out_dim, num_rels=num_rels)
+    rgat(g_dgl)
