@@ -14,46 +14,68 @@ import networkx as nx
 
 
 class RGATLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, num_rels, num_heads=5):
+    def __init__(self, in_dim, out_dim, num_rels, num_heads=5, self_interaction=True, num_bases=-1):
         super(RGATLayer, self).__init__()
         self.num_rels = num_rels
         self.num_heads = num_heads
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
+        self.self_interaction = self_interaction
+        if self_interaction:
+            self.self_fc = nn.Linear(in_dim, num_heads * out_dim, bias=False)
 
-        # Todo : try the basis sharing trick
-        # self.attn_fcs = [nn.Linear(2 * out_dim, num_heads, bias=False) for _ in range(num_rels)]
-        self.attn_fcs = nn.Parameter(torch.Tensor(self.num_rels, 2 * out_dim, num_heads))
+        # Basis sharing trick
+        if num_bases <= 0 or num_bases > self.num_rels:
+            self.num_bases = num_rels
+            self.use_basis_sharing = False
+        else:
+            self.num_bases = num_bases
+            self.use_basis_sharing = True
+
+        self.weight = nn.Parameter(torch.Tensor(self.num_bases, 2 * out_dim, num_heads))
+        if self.use_basis_sharing:
+            self.w_comp = nn.Parameter(torch.Tensor(self.num_rels, self.num_bases))
+
+        # self.attn_fcs = nn.Parameter(torch.Tensor(self.num_rels, 2 * out_dim, num_heads))
         self.reset_parameters()
 
     def reset_parameters(self):
         """Reinitialize learnable parameters."""
         gain = nn.init.calculate_gain('relu')
         nn.init.xavier_normal_(self.fc.weight, gain=gain)
-        nn.init.xavier_normal_(self.attn_fcs, gain=gain)
-        # for attn_fc in self.attn_fcs:
-        #     nn.init.xavier_normal_(attn_fc.weight, gain=gain)
+        if self.self_interaction:
+            nn.init.xavier_normal_(self.self_fc.weight, gain=gain)
+
+        # nn.init.xavier_normal_(self.attn_fcs, gain=gain)
+        nn.init.xavier_normal_(self.weight, gain=gain)
+        if self.use_basis_sharing:
+            nn.init.xavier_normal_(self.w_comp, gain=gain)
 
     def edge_attention(self, edges):
         """
         This is where the relational part hits
         """
+        # First build the correct attention scheme if using basis sharing
+        if self.use_basis_sharing:
+            attn_fcs = torch.einsum('ab,bcd->acd', (self.w_comp, self.weight))
+        else:
+            attn_fcs = self.weight
+
+        # Then apply the right Tensor to each concatenated message based on edge type
         z2 = torch.cat([edges.src['z'], edges.dst['z']], dim=1)
-        w = self.attn_fcs[edges.data['rel_type']]
+        w = attn_fcs[edges.data['rel_type']]
         a = torch.bmm(z2.unsqueeze(1), w)
         a = a.squeeze()
-        # print(a.shape)
-        return {'e': F.leaky_relu(a)}
+        # Todo : think about using no activation
+        return {'attention': F.leaky_relu(a)}
 
     def message_func(self, edges):
-        # print(edges.src['z'].shape)
-        # print(edges.data['e'].shape)
-        return {'z': edges.src['z'], 'e': edges.data['e']}
+        return {'z': edges.src['z'], 'attention': edges.data['attention']}
 
     def reduce_func(self, nodes):
         """
         Now use concatenation for the aggregation
         """
-        all_attentions = nodes.mailbox['e']  # shape : (similar_nodes, nei, heads)
+        all_attentions = nodes.mailbox['attention']  # shape : (similar_nodes, nei, heads)
         all_messages = nodes.mailbox['z']  # shape : (similar_nodes, nei, out_dim)
 
         # Compute scaling of messages with einsum and concatenate, then aggregate over neighbors
@@ -61,14 +83,17 @@ class RGATLayer(nn.Module):
                                        (all_attentions, all_messages))  # shape : (similar_nodes, nei, heads, out_dim)
         concatenated = torch.flatten(scaled_messages, start_dim=2)  # shape : (similar_nodes, nei, heads * out_dim)
         h = torch.sum(concatenated, dim=1)  # shape : (similar_nodes, heads * out_dim)
+
+        if self.self_interaction:
+            self_z = self.self_fc(nodes.data['h'])
+            h = h + self_z
         # print(all_attentions.shape)
         # print(all_messages.shape)
         # print(scaled_messages.shape)
-        # print(concatenated.shape)
+        # # print(concatenated.shape)
+        # print(self_z.shape)
         # print(h.shape)
         # print()
-
-        # TODO : add self-loop reduction
         return {'h': h}
 
     def forward(self, g):
@@ -213,5 +238,5 @@ if __name__ == '__main__':
     # rgcn = RGCNLayer(in_feat=in_dim, out_feat=out_dim, num_rels=num_rels)
     # rgcn(g_dgl)
     #
-    rgat = RGATLayer(in_dim=in_dim, out_dim=out_dim, num_rels=num_rels)
+    rgat = RGATLayer(in_dim=in_dim, out_dim=out_dim, num_rels=num_rels, num_bases=3)
     rgat(g_dgl)
