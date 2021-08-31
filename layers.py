@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from iso_mat import ISO_MAT
+from rnaglib.config.build_iso_mat import iso_mat
 
 
 class RGATLayer(nn.Module):
@@ -14,7 +14,8 @@ class RGATLayer(nn.Module):
                  self_loop=True,
                  activation=None,
                  num_bases=-1,
-                 iso_mat=ISO_MAT,
+                 iso_mat=iso_mat,
+                 return_loss=True,
                  sample_other=0.2):
         """
 
@@ -35,6 +36,7 @@ class RGATLayer(nn.Module):
         if self_loop:
             self.self_fc = nn.Linear(in_feat, self.num_heads * out_feat, bias=False)
         self.activation = activation
+        self.return_loss = return_loss
 
         # Basis sharing trick
         if num_bases is None or num_bases > self.num_rels:
@@ -68,6 +70,12 @@ class RGATLayer(nn.Module):
         nn.init.xavier_normal_(self.attention_weight, gain=gain)
         if self.use_basis_sharing:
             nn.init.xavier_normal_(self.w_comp, gain=gain)
+
+    def deactivate_loss(self):
+        self.return_loss = False
+
+    def activate_loss(self):
+        self.return_loss = True
 
     def edge_attention(self, edges):
         """
@@ -175,8 +183,7 @@ class RGATLayer(nn.Module):
         g.apply_edges(self.edge_attention)
 
         # Compute altered attention values for a fraction of edges and get a loss
-        sample_loss = None
-        if self.sample_other > 0.:
+        if self.return_loss:
             g.apply_edges(self.sampled_edge_attention)
             sample_loss = self.compute_isostericity_loss(g)
 
@@ -185,7 +192,11 @@ class RGATLayer(nn.Module):
         g.ndata.pop('z')
         g.ndata.pop('self_z')
         g.edata.pop('attention')
-        g.edata.pop('sampled_attention')
-        g.edata.pop('modified_edge_types')
+        if self.return_loss:
+            g.edata.pop('sampled_attention')
+            g.edata.pop('modified_edge_types')
         h = g.ndata.pop('h')
-        return h, sample_loss
+        if self.return_loss:
+            return h, sample_loss
+        else:
+            return h

@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dgl.nn.pytorch.conv import RelGraphConv
-
 from layers import RGATLayer
 
 
@@ -23,6 +21,7 @@ class RGATEmbedder(nn.Module):
                  num_bases=None,
                  conv_output=True,
                  self_loop=True,
+                 return_loss=True,
                  verbose=False):
         super(RGATEmbedder, self).__init__()
         self.dims = dims
@@ -35,6 +34,7 @@ class RGATEmbedder(nn.Module):
         self.num_bases = num_bases
         self.self_loop = self_loop
         self.verbose = verbose
+        self.return_loss = return_loss
 
         self.layers = self.build_model()
 
@@ -88,6 +88,11 @@ class RGATEmbedder(nn.Module):
         layers.append(h2o)
         return layers
 
+    def deactivate_loss(self):
+        for layer in self.layers:
+            if isinstance(layer, RGATLayer):
+                layer.deactivate_loss()
+
     @property
     def current_device(self):
         """
@@ -106,9 +111,15 @@ class RGATEmbedder(nn.Module):
             if not self.conv_output and (i == len(self.layers) - 1):
                 h = layer(h)
             else:
-                h, loss = layer(g=g, feat=h)
-                iso_loss += loss
-        return h, iso_loss
+                if layer.return_loss:
+                    h, loss = layer(g=g, feat=h)
+                    iso_loss += loss
+                else:
+                    h = layer(g=g, feat=h)
+        if self.return_loss:
+            return h, iso_loss
+        else:
+            return h
 
 
 class RGATClassifier(nn.Module):
@@ -127,6 +138,7 @@ class RGATClassifier(nn.Module):
                  conv_output=True,
                  self_loop=True,
                  verbose=False,
+                 return_loss=True,
                  sample_other=0.2):
         super(RGATClassifier, self).__init__()
         self.num_rels = num_rels
@@ -135,6 +147,7 @@ class RGATClassifier(nn.Module):
         self.conv_output = conv_output
         self.num_heads = num_heads
         self.sample_other = sample_other
+        self.return_loss = return_loss
 
         self.rgat_embedder = rgat_embedder
         self.last_dim_embedder = rgat_embedder.dims[-1] * rgat_embedder.num_heads
@@ -149,7 +162,7 @@ class RGATClassifier(nn.Module):
 
     def build_model(self):
         if self.classif_dims is None:
-            return []
+            return self.rgat_embedder
 
         classif_layers = nn.ModuleList()
         # Just one convolution
@@ -209,6 +222,13 @@ class RGATClassifier(nn.Module):
             classif_layers.append(h2o)
             return classif_layers
 
+    def deactivate_loss(self):
+        self.return_loss = False
+        self.rgat_embedder.deactivate_loss()
+        for layer in self.classif_layers:
+            if isinstance(layer, RGATLayer):
+                layer.deactivate_loss()
+
     @property
     def current_device(self):
         """
@@ -218,7 +238,11 @@ class RGATClassifier(nn.Module):
 
     def forward(self, g):
         iso_loss = 0
-        h, loss = self.rgat_embedder(g)
+        if self.rgat_embedder.return_loss:
+            h, loss = self.rgat_embedder(g)
+        else:
+            h = self.rgat_embedder(g)
+            loss = 0
         iso_loss += loss
         for i, layer in enumerate(self.classif_layers):
             # if this is the last layer and we want to use a linear layer, the call is different
@@ -226,6 +250,13 @@ class RGATClassifier(nn.Module):
                 h = layer(h)
             # Convolution layer
             else:
-                h, loss = layer(g, h)
-                iso_loss += loss
-        return h, iso_loss
+                if layer.return_loss:
+                    h, loss = layer(g, h)
+                    iso_loss += loss
+                else:
+                    h = layer(g, h)
+
+        if self.return_loss:
+            return h, iso_loss
+        else:
+            return h

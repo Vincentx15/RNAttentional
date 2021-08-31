@@ -28,9 +28,7 @@ if __name__ == '__main__':
     # Make a forward call
     feat = g_dgl.ndata['features']
     h, iso_loss = rgat(g_dgl, feat=feat)
-    print(iso_loss)
 
     rgat_embedder = RGATEmbedder(dims=[10, 10])
     rgat_model = RGATClassifier(rgat_embedder, classif_dims=[10, 10], verbose=True)
     h, iso_loss = rgat_model(g_dgl)
-    print(iso_loss)
